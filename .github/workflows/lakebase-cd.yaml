@@ -1,0 +1,61 @@
+name: Lakebase CD
+
+# Promote one commit dev -> acceptance -> prod. The image is built once into the
+# Actions cache (no registry push) and every stage reloads that same build.
+# acceptance is re-forked from production each run, so the upgrade is rehearsed on
+# today's prod data before prod is touched. prod waits for a required reviewer.
+
+on:
+  push:
+    branches: [lakebase]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lakebase-cd
+  cancel-in-progress: false
+
+jobs:
+  image:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packages/twenty-docker/twenty/Dockerfile
+          target: twenty
+          push: false
+          build-args: APP_VERSION=lakebase-${{ github.sha }}
+          cache-from: type=gha,scope=twenty-${{ github.sha }}
+          cache-to: type=gha,mode=max,scope=twenty-${{ github.sha }}
+
+  dev:
+    needs: image
+    uses: ./.github/workflows/lakebase-deploy.yaml
+    with:
+      environment: dev
+      lakebase_branch: dev
+    secrets: inherit
+
+  acceptance:
+    needs: dev
+    uses: ./.github/workflows/lakebase-deploy.yaml
+    with:
+      environment: acceptance
+      lakebase_branch: acceptance
+      refork_from: production
+    secrets: inherit
+
+  prod:
+    needs: acceptance
+    uses: ./.github/workflows/lakebase-deploy.yaml
+    with:
+      environment: prod
+      lakebase_branch: production
+      restore_point: true
+    secrets: inherit

@@ -1,0 +1,182 @@
+name: Lakebase PR
+
+# Every PR into `lakebase` gets its own copy-on-write Lakebase branch forked from `dev`:
+# the upgrade is rehearsed on real data, then the server integration suite runs on it.
+# See lakebase/README.md for the full promotion model.
+
+on:
+  pull_request:
+    branches: [lakebase]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+  DATABRICKS_AUTH_TYPE: oauth-m2m
+  LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+  LAKEBASE_BRANCH: pr-${{ github.event.pull_request.number || github.run_id }}
+  SERVER_BUILD_CACHE_KEY: server-build-lakebase
+  INTEGRATION_SHARDS: 8
+
+jobs:
+  lakebase-branch:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    outputs:
+      host: ${{ steps.branch.outputs.host }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      - name: Fork pr branch from dev
+        id: branch
+        run: echo "host=$(lakebase/scripts/lb.sh create "$LAKEBASE_BRANCH" dev 72h)" >> "$GITHUB_OUTPUT"
+
+  upgrade-rehearsal:
+    needs: lakebase-branch
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    environment: dev
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 10
+      - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+      - name: Build twenty-shared
+        run: npx nx build twenty-shared
+      - name: Server / Write .env
+        run: npx nx reset:env twenty-server
+      - name: Point server at the pr branch
+        env:
+          TWENTY_PG_PASSWORD: ${{ secrets.TWENTY_PG_PASSWORD }}
+        run: |
+          url=$(lakebase/scripts/lb.sh url "$LAKEBASE_BRANCH" twenty "$TWENTY_PG_PASSWORD")
+          echo "::add-mask::$url"
+          sed -i "s|^PG_DATABASE_URL=.*|PG_DATABASE_URL=$url|" packages/twenty-server/.env
+          echo "PG_DATABASE_URL=$url" >> "$GITHUB_ENV"
+      - name: Server / Build
+        run: npx nx build twenty-server
+      - name: Snapshot row counts
+        run: pip install -q 'psycopg[binary]' && python3 lakebase/scripts/invariants.py snapshot before.json
+      - name: Upgrade (instance + workspace commands)
+        working-directory: packages/twenty-server
+        run: |
+          yarn command:prod cache:flush
+          time yarn command:prod upgrade
+          yarn command:prod cache:flush
+      - name: Row counts unchanged
+        run: |
+          python3 lakebase/scripts/invariants.py snapshot after.json
+          python3 lakebase/scripts/invariants.py compare before.json after.json
+      - name: No pending TypeORM migrations
+        run: |
+          npx nx database:migrate:generate twenty-server -- --name pending-migration-check || true
+          git diff --exit-code -- packages/twenty-server/src/database
+      - name: Server / Start
+        run: npx nx start:ci twenty-server &
+      - name: Search smoke test
+        run: |
+          for _ in $(seq 1 90); do curl -fs http://localhost:3000/healthz && break; sleep 2; done
+          python3 lakebase/scripts/smoke.py
+
+  integration:
+    needs: lakebase-branch
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8.8
+        env:
+          CLICKHOUSE_PASSWORD: clickhousePassword
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "clickhouse-client --host=localhost --port=9000 --user=default --password=clickhousePassword --query='SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: test
+      ANALYTICS_ENABLED: true
+      CLICKHOUSE_URL: "http://default:clickhousePassword@localhost:8123/twenty"
+      CLICKHOUSE_PASSWORD: clickhousePassword
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 10
+      - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+      # One database per shard on the shared pr branch, owned by the CI principal.
+      # Its OAuth token lasts 1h, which bounds this job's timeout.
+      - name: Create shard database
+        run: |
+          db="test_${{ matrix.shard }}"
+          token=$(lakebase/scripts/lb.sh token "$LAKEBASE_BRANCH")
+          echo "::add-mask::$token"
+          host="${{ needs.lakebase-branch.outputs.host }}"
+          export PGPASSWORD="$token" PGSSLMODE=require
+          psql -h "$host" -U "$DATABRICKS_CLIENT_ID" -d postgres -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" -c "CREATE DATABASE $db"
+          for ext in uuid-ossp unaccent citext; do
+            psql -h "$host" -U "$DATABRICKS_CLIENT_ID" -d "$db" -c "CREATE EXTENSION IF NOT EXISTS \"$ext\""
+          done
+          url=$(python3 -c 'import sys,urllib.parse as u;print(f"postgres://{u.quote(sys.argv[1])}:{u.quote(sys.argv[2],safe=\"\")}@{sys.argv[3]}:5432/{sys.argv[4]}?sslmode=require")' "$DATABRICKS_CLIENT_ID" "$token" "$host" "$db")
+          echo "::add-mask::$url"
+          sed -i "s|^PG_DATABASE_URL=.*|PG_DATABASE_URL=$url|" packages/twenty-server/.env.test
+          {
+            echo "IS_BILLING_ENABLED=true"
+            echo "BILLING_STRIPE_API_KEY=test-api-key"
+            echo "BILLING_STRIPE_BASE_PLAN_PRODUCT_ID=test-base-plan-product-id"
+            echo "BILLING_STRIPE_WEBHOOK_SECRET=test-webhook-secret"
+            echo "BILLING_PLAN_REQUIRED_LINK=http://localhost:3001/stripe-redirection"
+          } >> packages/twenty-server/.env.test
+      - name: Server / Build
+        run: npx nx build twenty-server
+      - name: Run ClickHouse migrations
+        run: npx nx clickhouse:migrate twenty-server
+      - name: Reset test DB (init + seed) on Lakebase
+        env:
+          NODE_OPTIONS: --max-old-space-size=12288
+        run: npx nx database:reset twenty-server --excludeTaskDependencies
+      - name: Integration tests (shard ${{ matrix.shard }}/${{ env.INTEGRATION_SHARDS }})
+        run: npx nx run twenty-server:test:integration --shard=${{ matrix.shard }}/${{ env.INTEGRATION_SHARDS }}
+
+  teardown:
+    needs: [lakebase-branch, upgrade-rehearsal, integration]
+    if: always() && needs.lakebase-branch.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      # Failed branches stay (72h TTL) for debugging, but their compute is stopped:
+      # a project only runs ~20 endpoints at once and extra branches stall silently.
+      - name: Delete on success, stop compute on failure
+        run: |
+          if [ "${{ needs.upgrade-rehearsal.result }}" = success ] && [ "${{ needs.integration.result }}" = success ]; then
+            lakebase/scripts/lb.sh delete "$LAKEBASE_BRANCH"
+          else
+            lakebase/scripts/lb.sh disable "$LAKEBASE_BRANCH"
+          fi
