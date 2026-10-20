@@ -54,6 +54,13 @@ jobs:
         with:
           fetch-depth: 10
       - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      # A cold yarn install (~3.6 GiB + link) runs the stock runner out of disk.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          df -h /
       - name: Install dependencies
         uses: ./.github/actions/yarn-install
       - name: Build twenty-shared
@@ -128,6 +135,13 @@ jobs:
         with:
           fetch-depth: 10
       - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      # A cold yarn install (~3.6 GiB + link) runs the stock runner out of disk.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          df -h /
       - name: Install dependencies
         uses: ./.github/actions/yarn-install
       # One database per shard on the shared pr branch, owned by the CI principal.
