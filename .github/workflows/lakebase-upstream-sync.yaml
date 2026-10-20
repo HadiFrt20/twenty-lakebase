@@ -1,0 +1,44 @@
+name: Lakebase upstream sync
+
+# Daily: fast-forward `main` to twentyhq/twenty, then open a PR main -> lakebase.
+# That PR runs Lakebase PR, so every upstream release re-runs every migration on Lakebase.
+# Needs SYNC_TOKEN (fine-grained PAT: contents, pull-requests, workflows on this repo):
+# GITHUB_TOKEN can neither push workflow-file changes nor trigger workflows from its PRs.
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository_owner != 'twentyhq'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+    steps:
+      - name: Require SYNC_TOKEN
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::SYNC_TOKEN is not set, skipping upstream sync"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+      - name: Fast-forward main to upstream
+        if: env.SKIP != '1'
+        run: gh api "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main --jq .message
+      - name: Open sync PR into lakebase
+        if: env.SKIP != '1'
+        run: |
+          ahead=$(gh api "repos/${GITHUB_REPOSITORY}/compare/lakebase...main" --jq .ahead_by)
+          open=$(gh pr list -R "$GITHUB_REPOSITORY" --base lakebase --head main --state open --json number --jq length)
+          if [ "$ahead" -gt 0 ] && [ "$open" = 0 ]; then
+            gh pr create -R "$GITHUB_REPOSITORY" --base lakebase --head main \
+              --title "Sync upstream twentyhq/twenty ($(date -u +%F))" \
+              --body "Upstream is $ahead commits ahead. Lakebase PR re-runs the full upgrade and integration suite on a fresh Lakebase branch."
+          else
+            echo "ahead_by=$ahead open_sync_prs=$open, nothing to open"
+          fi

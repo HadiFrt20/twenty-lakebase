@@ -13,7 +13,7 @@ async function dropSchemasSequentially() {
       FROM pg_catalog.pg_namespace n
       WHERE n.nspname !~ '^pg_'
         AND n.nspname <> 'information_schema'
-        AND n.nspname NOT IN ('metric_helpers', 'user_management', 'public')
+        AND n.nspname NOT IN ('metric_helpers', 'user_management', 'public', '__db_system')
     `,
         'Fetching schemas...',
       )) ?? [];

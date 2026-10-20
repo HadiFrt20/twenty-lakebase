@@ -1,0 +1,97 @@
+name: Lakebase deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      lakebase_branch:
+        type: string
+        required: true
+      refork_from:
+        description: Re-create the branch from this parent before migrating (fresh prod copy)
+        type: string
+        default: ''
+      restore_point:
+        description: Fork a 7-day pre-release branch first, to roll back to
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+  DATABRICKS_AUTH_TYPE: oauth-m2m
+  LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+  IMAGE: twenty-lakebase:${{ github.sha }}
+
+jobs:
+  deploy:
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
+      # Twenty's cold yarn install (~3.6 GiB) and image build need headroom.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Load image built by the CD run
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packages/twenty-docker/twenty/Dockerfile
+          target: twenty
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: APP_VERSION=lakebase-${{ github.sha }}
+          cache-from: type=gha,scope=twenty-${{ github.sha }}
+      - name: Re-fork ${{ inputs.lakebase_branch }} from ${{ inputs.refork_from }}
+        if: inputs.refork_from != ''
+        run: lakebase/scripts/lb.sh create "${{ inputs.lakebase_branch }}" "${{ inputs.refork_from }}" never
+      - name: Restore point
+        if: inputs.restore_point
+        run: |
+          lakebase/scripts/lb.sh create "pre-${GITHUB_SHA::7}" "${{ inputs.lakebase_branch }}" 7d
+          lakebase/scripts/lb.sh disable "pre-${GITHUB_SHA::7}"
+      - name: Resolve database URL
+        env:
+          TWENTY_PG_PASSWORD: ${{ secrets.TWENTY_PG_PASSWORD }}
+        run: |
+          url=$(lakebase/scripts/lb.sh url "${{ inputs.lakebase_branch }}" twenty "$TWENTY_PG_PASSWORD")
+          echo "::add-mask::$url"
+          echo "PG_DATABASE_URL=$url" >> "$GITHUB_ENV"
+      - name: Snapshot row counts
+        run: pip install -q 'psycopg[binary]' && python3 lakebase/scripts/invariants.py snapshot before.json
+      - name: Migrate
+        run: lakebase/scripts/migrate.sh "$IMAGE"
+      - name: Row counts unchanged
+        run: |
+          python3 lakebase/scripts/invariants.py snapshot after.json
+          python3 lakebase/scripts/invariants.py compare before.json after.json
+      - name: Smoke test (boot + login + search)
+        run: lakebase/scripts/smoke.sh "$IMAGE"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deploy-${{ inputs.environment }}
+          path: |
+            before.json
+            after.json
+            smoke-server.log
+          if-no-files-found: ignore
