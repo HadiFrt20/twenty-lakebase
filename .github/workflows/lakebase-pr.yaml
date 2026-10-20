@@ -29,7 +29,7 @@ env:
 jobs:
   lakebase-branch:
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       host: ${{ steps.branch.outputs.host }}
     steps:
@@ -42,7 +42,7 @@ jobs:
   upgrade-rehearsal:
     needs: lakebase-branch
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: dev
     services:
       redis:
@@ -54,7 +54,7 @@ jobs:
         with:
           fetch-depth: 10
       - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
-      # A cold yarn install (~3.6 GiB + link) runs the stock runner out of disk.
+      # Twenty's cold yarn install (~3.6 GiB) and image build need headroom.
       - name: Free runner disk
         run: |
           df -h /
@@ -103,7 +103,7 @@ jobs:
   integration:
     needs: lakebase-branch
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +135,7 @@ jobs:
         with:
           fetch-depth: 10
       - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
-      # A cold yarn install (~3.6 GiB + link) runs the stock runner out of disk.
+      # Twenty's cold yarn install (~3.6 GiB) and image build need headroom.
       - name: Free runner disk
         run: |
           df -h /
@@ -181,7 +181,7 @@ jobs:
   teardown:
     needs: [lakebase-branch, upgrade-rehearsal, integration]
     if: always() && needs.lakebase-branch.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0

@@ -32,7 +32,7 @@ env:
 jobs:
   deploy:
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: ${{ inputs.environment }}
     services:
       redis:
@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: databricks/setup-cli@9b64c94a6d2b2e830592d80e9f14c26d32b42ad7 # v1.20.0
-      # A cold yarn install (~3.6 GiB + link) runs the stock runner out of disk.
+      # Twenty's cold yarn install (~3.6 GiB) and image build need headroom.
       - name: Free runner disk
         run: |
           df -h /

@@ -20,10 +20,10 @@ concurrency:
 jobs:
   image:
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      # A cold yarn install (~3.6 GiB + link) runs the stock runner out of disk.
+      # Twenty's cold yarn install (~3.6 GiB) and image build need headroom.
       - name: Free runner disk
         run: |
           df -h /
